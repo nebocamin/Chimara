@@ -389,6 +389,20 @@ reset_input_queues(ChimaraGlkPrivate *priv)
 	priv->line_input_queue = g_async_queue_new_full(g_free);
 }
 
+/* The UI message source has no prepare() or check() functions: it is only ever
+ * woken up by g_source_set_ready_time(), which is thread-safe and wakes up the
+ * main context if it is sleeping in poll(). So there is no busy-waiting when
+ * the queue is empty. */
+static gboolean
+ui_message_source_dispatch(GSource *source, GSourceFunc callback, void *user_data)
+{
+	return callback(user_data);
+}
+
+static GSourceFuncs ui_message_source_funcs = {
+	.dispatch = ui_message_source_dispatch,
+};
+
 static void
 chimara_glk_init(ChimaraGlk *self)
 {
@@ -404,6 +418,17 @@ chimara_glk_init(ChimaraGlk *self)
 	priv->glk_styles = g_new0(StyleSet,1);
 	priv->final_message = g_strdup("[ The game has finished ]");
 	priv->ui_message_queue = g_async_queue_new_full((GDestroyNotify)ui_message_free);
+
+	/* The source stays attached (but dormant) for the lifetime of the widget,
+	 * so that the Glk thread can always safely wake it up. */
+	priv->ui_message_source = g_source_new(&ui_message_source_funcs, sizeof(GSource));
+	g_source_set_name(priv->ui_message_source, "Chimara UI message queue");
+	g_source_set_priority(priv->ui_message_source, G_PRIORITY_DEFAULT_IDLE);
+	g_source_set_ready_time(priv->ui_message_source, -1);
+	g_source_set_callback(priv->ui_message_source,
+		(GSourceFunc)chimara_glk_process_queue, self, NULL);
+	g_source_attach(priv->ui_message_source, NULL);
+
     priv->event_queue = g_queue_new();
 	reset_input_queues(priv);
 
@@ -498,6 +523,8 @@ chimara_glk_finalize(GObject *object)
 	g_hash_table_destroy(priv->glk_styles->text_buffer);
 	g_hash_table_destroy(priv->glk_styles->text_grid);
 
+	g_source_destroy(priv->ui_message_source);
+	g_clear_pointer(&priv->ui_message_source, g_source_unref);
 	g_async_queue_unref(priv->ui_message_queue);
 
     /* Free the event queue */
@@ -1431,22 +1458,57 @@ glk_enter(struct StartupData *startup)
 	return NULL;
 }
 
-/* Private method. Fetches a UI message from the message queue, and if there is
- * one, carries out the instructions therein.
+/* Maximum time to spend processing UI messages in one main loop iteration, so
+ * that the UI stays responsive (redraws, input) while the Glk program floods
+ * the queue with output. */
+#define UI_MESSAGE_TIME_SLICE_US (8 * G_TIME_SPAN_MILLISECOND)
+
+/* Private method. Fetches UI messages from the message queue and carries out
+ * the instructions therein, until the queue is empty or the time slice is used
+ * up.
  * This function must be called from the UI thread.
- * Always returns %G_SOURCE_CONTINUE (this is meant to be called as an idle
- * function.) */
+ * It is the callback of priv->ui_message_source, which is only dispatched when
+ * the Glk thread has woken it up with chimara_glk_wake_ui_message_source(), so
+ * it does not use any CPU while the Glk program is idle.
+ * Always returns %G_SOURCE_CONTINUE. */
 gboolean
 chimara_glk_process_queue(ChimaraGlk *self)
 {
 	ChimaraGlkPrivate *priv = chimara_glk_get_instance_private(self);
 
-	UiMessage *msg = g_async_queue_try_pop(priv->ui_message_queue);
-	if (msg == NULL)
-		return G_SOURCE_CONTINUE;
+	/* Go back to sleep first, before looking at the queue: if the Glk thread
+	 * pushes a message after this point, it will wake us up again, so no
+	 * wakeup can get lost. At worst we get one spurious wakeup with an empty
+	 * queue. */
+	g_source_set_ready_time(priv->ui_message_source, -1);
 
-	ui_message_perform(self, msg);
+	gint64 deadline = g_get_monotonic_time() + UI_MESSAGE_TIME_SLICE_US;
+
+	while (priv->processing_ui_messages) {
+		UiMessage *msg = g_async_queue_try_pop(priv->ui_message_queue);
+		if (msg == NULL)
+			break;
+
+		ui_message_perform(self, msg);
+
+		if (g_get_monotonic_time() >= deadline) {
+			/* Let GTK process events and redraw, and continue with the
+			 * rest of the queue in the next main loop iteration. */
+			if (priv->processing_ui_messages)
+				g_source_set_ready_time(priv->ui_message_source, 0);
+			break;
+		}
+	}
+
 	return G_SOURCE_CONTINUE;
+}
+
+/* Private method. Wakes up the UI thread to process the UI message queue.
+ * May be called from any thread. */
+void
+chimara_glk_wake_ui_message_source(ChimaraGlkPrivate *priv)
+{
+	g_source_set_ready_time(priv->ui_message_source, 0);
 }
 
 /**
@@ -1540,7 +1602,7 @@ chimara_glk_run(ChimaraGlk *self, const gchar *plugin, int argc, char *argv[], G
 	priv->ignore_next_arrange_event = FALSE;
 
 	/* Start listening for UI messages */
-	priv->ui_message_handler_id = gdk_threads_add_timeout(20, (GSourceFunc)chimara_glk_process_queue, self);
+	priv->processing_ui_messages = TRUE;
 
     /* Run in a separate thread */
 	g_clear_pointer(&priv->thread, g_thread_unref);
@@ -1612,20 +1674,20 @@ chimara_glk_stop(ChimaraGlk *self)
 /* Private method. Processes all the remaining instructions in the message
  * queue, only returning when the shutdown message is received. (If you haven't
  * signalled the Glk program to stop, then this function might not ever return.)
+ *
+ * The messages are processed by priv->ui_message_source as usual. We must not
+ * block on the queue here, because some messages (UI_MESSAGE_SYNC_ARRANGE) are
+ * only answered after a size-allocate, which needs the main loop to run.
+ * Blocking in the main loop costs no CPU, since the Glk thread wakes it up
+ * whenever it queues a message.
  */
 void
 chimara_glk_drain_queue(ChimaraGlk *self)
 {
 	ChimaraGlkPrivate *priv = chimara_glk_get_instance_private(self);
 
-	while (TRUE) {
-		if (priv->ui_message_handler_id == 0)
-			return;
-		UiMessage *msg = g_async_queue_pop(priv->ui_message_queue);
-		ui_message_perform (self, msg);
-		while (gtk_events_pending())
-			gtk_main_iteration();
-	}
+	while (priv->processing_ui_messages)
+		g_main_context_iteration(NULL, TRUE);
 }
 
 /**
@@ -1997,11 +2059,10 @@ void
 chimara_glk_stop_processing_queue(ChimaraGlk *self)
 {
 	ChimaraGlkPrivate *priv = chimara_glk_get_instance_private(self);
-	if (priv->ui_message_handler_id)
-	{
-		g_source_remove(priv->ui_message_handler_id);
-		priv->ui_message_handler_id = 0;
-	}
+	/* Don't destroy the source here: the Glk thread may still be about to wake
+	 * it up. Just stop processing messages; the source stays dormant until the
+	 * next program is run. */
+	priv->processing_ui_messages = FALSE;
 }
 
 /* Helper function: Turn off shutdown key-press-event signal handler */

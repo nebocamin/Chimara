@@ -62,9 +62,12 @@ struct _ChimaraGlkPrivate {
     GModule *program;
     /* Thread in which Glk program is run */
     GThread *thread;
-	/* Pipe through which to schedule updates to the UI */
-	unsigned ui_message_handler_id;
+	/* Pipe through which to schedule updates to the UI. The Glk thread pushes
+	 * messages onto the queue and then wakes up the source, which is attached
+	 * to the UI thread's main context for the whole lifetime of the widget. */
 	GAsyncQueue *ui_message_queue;
+	GSource *ui_message_source;
+	gboolean processing_ui_messages;
     /* Event queue and threading stuff */
     GQueue *event_queue;
 	GMutex event_lock;
@@ -139,6 +142,7 @@ G_GNUC_INTERNAL GtkTextTag *chimara_glk_get_glk_tag(ChimaraGlk *self, ChimaraGlk
 G_GNUC_INTERNAL gboolean chimara_glk_needs_rearrange(ChimaraGlk *self);
 G_GNUC_INTERNAL void chimara_glk_queue_arrange(ChimaraGlk *self, gboolean suppress_next_arrange_event);
 G_GNUC_INTERNAL gboolean chimara_glk_process_queue(ChimaraGlk *self);
+G_GNUC_INTERNAL void chimara_glk_wake_ui_message_source(ChimaraGlkPrivate *priv);
 G_GNUC_INTERNAL void chimara_glk_drain_queue(ChimaraGlk *self);
 G_GNUC_INTERNAL void chimara_glk_stop_processing_queue(ChimaraGlk *self);
 G_GNUC_INTERNAL void chimara_glk_clear_shutdown(ChimaraGlk *self);
